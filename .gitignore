@@ -1,1 +1,55 @@
-kls_vdit_hourly_market.csv
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+docs/
+
+# Environment
+.venv/
+venv/
+.env
+.env.*
+
+# Secrets — never commit credentials
+secrets/
+*.key
+*.pem
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data (keep raw, ignore generated)
+data/processed/*.parquet
+data/processed/metadata.json
+data/synthetic/
+data/raw/kls_vdit_hourly_market.csv
+
+# Trained model artifacts (contain pickled Python — security risk)
+# Use GitHub Releases or cloud storage instead
+*.zip
+
+# Large data files
+*.csv
+
+# Training outputs
+checkpoints/
+logs/
+experiments/
+ppo_tensorboard/
+!**/.gitkeep
+
+# Ray
+/tmp/ray/
+ray_results/
+
+# OS
+.DS_Store
+Thumbs.db

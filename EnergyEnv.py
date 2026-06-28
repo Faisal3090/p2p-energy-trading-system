@@ -58,8 +58,15 @@ class EnergyTradingEnv(gym.Env):
     TRADE_CAPACITY_FACTOR = 1.0 
 
     def __init__(self, csv_path: str = "kls_vdit_hourly_market.csv",
-                 render_mode=None, scale_hotel: float = 1.0):
+                 render_mode: str | None = None, scale_hotel: float = 1.0):
         super().__init__()
+
+        # Security: reject paths containing directory traversal
+        if ".." in str(csv_path):
+            raise ValueError(f"csv_path must not contain '..': {csv_path}")
+        if scale_hotel <= 0:
+            raise ValueError(f"scale_hotel must be positive, got {scale_hotel}")
+
         self.render_mode = render_mode
         self.csv_path = csv_path
         self.scale_hotel = scale_hotel  # multiply neighbour demand to simulate more neighbors
@@ -107,7 +114,7 @@ class EnergyTradingEnv(gym.Env):
         return np.array([
             np.clip(solar     / self.MAX_SOLAR,     0, 1),
             np.clip(demand    / self.MAX_DEMAND,    0, 1),
-            np.clip(neighbour / self.MAX_NEIGHBOUR, 0, 1),
+            np.clip(neighbour / (self.MAX_NEIGHBOUR * self.scale_hotel) if self.scale_hotel > 0 else 0, 0, 1),
             np.clip(self.battery_soc / self.BATTERY_CAPACITY_KWH, 0, 1),
             hour / 23.0,
             np.clip(surplus / self.MAX_SURPLUS, 0, 1),
@@ -136,7 +143,8 @@ class EnergyTradingEnv(gym.Env):
         return self._get_obs(), self._get_info()
 
     def step(self, action: int):
-        assert self.action_space.contains(action), f"Invalid action: {action}"
+        if not self.action_space.contains(action):
+            raise ValueError(f"Invalid action: {action}. Must be 0, 1, or 2.")
 
         #Safety guard: don't step past end
         if self.current_step >= self.total_steps:
@@ -148,30 +156,39 @@ class EnergyTradingEnv(gym.Env):
         neighbour = float(row["Neighbor_Hotel_kW"]) * self.scale_hotel
         surplus   = solar - demand
 
+        current_battery_soc = self.battery_soc
+
         reward         = 0.0
         grid_import_kw = 0.0
         trade_kw       = 0.0
         stored_kw      = 0.0
         action_label   = ["USE", "STORE", "TRADE"][action]
 
-        #Deficit is common to all actions
+        # Deficit handling (automatic battery discharge first, then grid import)
         if surplus < 0:
-            grid_import_kw = abs(surplus)
+            deficit = abs(surplus)
+            # Battery discharge to cover deficit
+            discharge_kw = min(deficit, self.battery_soc, self.BATTERY_CHARGE_RATE)
+            self.battery_soc -= discharge_kw
+            grid_import_kw = deficit - discharge_kw
             reward -= grid_import_kw * self.GRID_BUY_ALLIN  # true cost of import
 
-        #Action logic (applies only to surplus)
-        if surplus > 0:
+        # Surplus handling (action determines what we do with surplus solar)
+        elif surplus > 0:
             if action == 0:  # USE — export surplus to grid
                 reward += surplus * self.GRID_SELL_PRICE
 
             elif action == 1:  # STORE — charge battery
                 charge_kw    = min(surplus, self.BATTERY_CHARGE_RATE)
-                stored_kw    = charge_kw * self.BATTERY_EFFICIENCY
-                self.battery_soc = min(self.battery_soc + stored_kw,
-                                       self.BATTERY_CAPACITY_KWH)
-                leftover = surplus - charge_kw
-                # Battery value: avoids GRID_BUY_ALLIN import later
-                reward += stored_kw * self.GRID_BUY_ALLIN * 0.9
+                # Remaining physical capacity in battery
+                remaining_cap = self.BATTERY_CAPACITY_KWH - self.battery_soc
+                # Stored energy considering charging efficiency
+                stored_kw    = min(charge_kw * self.BATTERY_EFFICIENCY, remaining_cap)
+                # Actual power drawn from surplus to charge battery
+                actual_charge_kw = stored_kw / self.BATTERY_EFFICIENCY if stored_kw > 0 else 0.0
+                self.battery_soc += stored_kw
+                
+                leftover = surplus - actual_charge_kw
                 reward += leftover * self.GRID_SELL_PRICE
 
             elif action == 2:  # TRADE — P2P to neighbour
@@ -180,19 +197,19 @@ class EnergyTradingEnv(gym.Env):
                 leftover = surplus - trade_kw
                 reward  += leftover * self.GRID_SELL_PRICE       # rest goes to grid
 
-        elif action == 1 and self.battery_soc > 0:
-            # No surplus but battery available — discharge to cover deficit
-            discharge = min(abs(surplus) if surplus < 0 else 0, self.battery_soc)
-            self.battery_soc -= discharge
-            # Already penalised above; reduce penalty by what battery covered
-            reward += discharge * self.GRID_BUY_ALLIN
-
         #Grid-safety hook
         grid_safe = True
         if self._grid_safety_fn is not None and trade_kw > 0:
             grid_safe = self._grid_safety_fn(trade_kw)
             if not grid_safe:
                 reward -= 50.0
+
+        physical_reward = reward
+        
+        # Potential-based reward shaping: Phi(s) = battery_soc * GRID_BUY_ALLIN
+        gamma = 0.99
+        shaping_reward = (gamma * self.battery_soc - current_battery_soc) * self.GRID_BUY_ALLIN
+        training_reward = physical_reward + shaping_reward
 
         #Log
         log_entry = {
@@ -202,7 +219,7 @@ class EnergyTradingEnv(gym.Env):
             "surplus_kw": round(surplus, 2), "trade_kw": round(trade_kw, 2),
             "stored_kw": round(stored_kw, 2), "grid_import_kw": round(grid_import_kw, 2),
             "battery_soc_kwh": round(self.battery_soc, 2),
-            "reward": round(reward, 3), "grid_safe": grid_safe,
+            "reward": round(physical_reward, 3), "grid_safe": grid_safe,
         }
         self.episode_log.append(log_entry)
 
@@ -213,7 +230,7 @@ class EnergyTradingEnv(gym.Env):
 
         if self.render_mode == "human":
             self.render()
-        return obs, reward, terminated, False, info
+        return obs, training_reward, terminated, False, info
 
     def render(self):
         if not self.episode_log:
